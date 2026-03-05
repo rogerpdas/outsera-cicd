@@ -68,8 +68,10 @@ jobs:
     timeout-minutes: 10  # Sem timeout o job pode travar até 6h (limite global)
 
     steps:
-      - name: "Checkout do repositório"
+      - name: "Checkout do repositório alvo"
         uses: actions/checkout@v4
+        with:
+          repository: rogerpdas/outsera-automacao-testes-mobile
 
       - name: "Configurar Java ${{ env.JAVA_VERSION }} (Temurin)"
         uses: actions/setup-java@v4
@@ -109,8 +111,10 @@ jobs:
     timeout-minutes: 60
 
     steps:
-      - name: "Checkout do repositório"
+      - name: "Checkout do repositório alvo"
         uses: actions/checkout@v4
+        with:
+          repository: rogerpdas/outsera-automacao-testes-mobile
 
       - name: "Configurar Java ${{ env.JAVA_VERSION }} (Temurin)"
         uses: actions/setup-java@v4
@@ -294,7 +298,8 @@ jobs:
         if: always() && github.ref == 'refs/heads/main'
         uses: peaceiris/actions-gh-pages@v3
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
+          personal_token: ${{ secrets.GH_PAT }}
+          external_repository: rogerpdas/outsera-automacao-testes-mobile
           publish_dir: ./reports
           publish_branch: gh-pages
 

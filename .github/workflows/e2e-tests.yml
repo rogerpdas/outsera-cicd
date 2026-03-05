@@ -79,8 +79,10 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - name: "Checkout do repositório"
+      - name: "Checkout do repositório alvo"
         uses: actions/checkout@v4
+        with:
+          repository: rogerpdas/outsera-automacao-testes-web
 
       - name: "Configurar Java ${{ env.JAVA_VERSION }} (Temurin)"
         uses: actions/setup-java@v4
@@ -143,8 +145,10 @@ jobs:
     timeout-minutes: 30
 
     steps:
-      - name: "Checkout do repositório"
+      - name: "Checkout do repositório alvo"
         uses: actions/checkout@v4
+        with:
+          repository: rogerpdas/outsera-automacao-testes-web
 
       - name: "Configurar Java ${{ env.JAVA_VERSION }} (Temurin)"
         uses: actions/setup-java@v4
@@ -225,8 +229,10 @@ jobs:
     timeout-minutes: 30
 
     steps:
-      - name: "Checkout do repositório"
+      - name: "Checkout do repositório alvo"
         uses: actions/checkout@v4
+        with:
+          repository: rogerpdas/outsera-automacao-testes-web
 
       - name: "Configurar Java ${{ env.JAVA_VERSION }} (Temurin)"
         uses: actions/setup-java@v4
@@ -310,8 +316,10 @@ jobs:
     if: always()
 
     steps:
-      - name: "Checkout do repositório (para deploy)"
+      - name: "Checkout do repositório alvo (para deploy)"
         uses: actions/checkout@v4
+        with:
+          repository: rogerpdas/outsera-automacao-testes-web
 
       # Baixa o relatório de Login para consolidar no Pages
       - name: "Download — Relatório Login"
@@ -414,7 +422,8 @@ jobs:
         if: github.ref == 'refs/heads/main'
         uses: peaceiris/actions-gh-pages@v3
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
+          personal_token: ${{ secrets.GH_PAT }}
+          external_repository: rogerpdas/outsera-automacao-testes-web
           publish_dir: ./reports
           publish_branch: gh-pages
           keep_files: false
