@@ -1,0 +1,379 @@
+name: "Mobile Tests — Appium + Android (KVM)"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# GATILHOS
+# ──────────────────────────────────────────────────────────────────────────────
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Execução noturna toda segunda a sexta às 05:00 UTC (02:00 BRT)
+    # Consistente com os pipelines de API (03:00) e Web (04:00)
+    - cron: "0 5 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      tags:
+        description: "Tags Cucumber (ex: @smoke, @regression, @login)"
+        required: false
+        default: "@smoke"
+        type: string
+
+# ──────────────────────────────────────────────────────────────────────────────
+# PERMISSÕES — necessárias para o deploy no GitHub Pages via peaceiris
+# ──────────────────────────────────────────────────────────────────────────────
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CONCORRÊNCIA — cancela runs anteriores no mesmo branch/PR
+# ──────────────────────────────────────────────────────────────────────────────
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: true
+
+# ──────────────────────────────────────────────────────────────────────────────
+# VARIÁVEIS GLOBAIS
+# ──────────────────────────────────────────────────────────────────────────────
+env:
+  JAVA_VERSION: "17"
+  NODE_VERSION: "20"
+  ANDROID_API_LEVEL: 31
+  APPIUM_VERSION: "2.5.4"
+  UIAUTOMATOR2_VERSION: "2.9.1"
+  MAVEN_OPTS: >-
+    -Xmx1g
+    -XX:+TieredCompilation
+    -XX:TieredStopAtLevel=1
+    -Djava.security.egd=file:/dev/./urandom
+  APK_URL: "https://github.com/saucelabs/sample-app-mobile/releases/download/2.7.1/Android.SauceLabs.Mobile.Sample.app.2.7.1.apk"
+  APK_MIN_SIZE_KB: 5000  # APK real tem ~12MB; qualquer coisa abaixo de 5MB é erro
+
+# ──────────────────────────────────────────────────────────────────────────────
+# JOBS
+# ──────────────────────────────────────────────────────────────────────────────
+jobs:
+
+  # ============================================================================
+  # JOB 1 ── BUILD E VALIDAÇÃO
+  # Falha rápida e barata: garante que o projeto compila antes de qualquer
+  # coisa mais cara (setup de emulador, Appium, download de APK).
+  # ============================================================================
+  build:
+    name: "Build & Compile"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10  # Sem timeout o job pode travar até 6h (limite global)
+
+    steps:
+      - name: "Checkout do repositório"
+        uses: actions/checkout@v4
+
+      - name: "Configurar Java ${{ env.JAVA_VERSION }} (Temurin)"
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          cache: maven
+
+      # Ordem semântica correta: validate verifica o pom.xml antes de compilar
+      - name: "Validar estrutura do pom.xml"
+        run: mvn validate --no-transfer-progress --batch-mode
+
+      - name: "Compilar fontes principais"
+        run: mvn compile --no-transfer-progress --batch-mode -q
+
+      - name: "🔨 Compilar fontes de teste"
+        run: mvn test-compile --no-transfer-progress --batch-mode -q
+
+  # ============================================================================
+  # JOB 2 ── TESTES ANDROID COM EMULADOR (KVM)
+  #
+  # Estratégia de emulador: Ubuntu + KVM + reactivecircus/android-emulator-runner
+  # É a solução padrão da indústria para Android em GitHub Actions gratuito.
+  # KVM (Kernel-based Virtual Machine) está disponível nos runners ubuntu-latest
+  # e proporciona hardware acceleration sem custo adicional.
+  #
+  # Por que run-tests.sh em vez de comandos inline no 'script:'?
+  # O campo 'script:' da android-emulator-runner executa cada linha em um
+  # processo /usr/bin/sh -c separado. Variáveis exportadas, blocos if/for e
+  # qualquer estado não persistem entre linhas. Toda a lógica vai para um
+  # script externo que é chamado como processo único.
+  # ============================================================================
+  test-android:
+    name: "Android Tests — API ${{ env.ANDROID_API_LEVEL }}"
+    runs-on: ubuntu-latest
+    needs: build
+    timeout-minutes: 60
+
+    steps:
+      - name: "Checkout do repositório"
+        uses: actions/checkout@v4
+
+      - name: "Configurar Java ${{ env.JAVA_VERSION }} (Temurin)"
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          cache: maven
+
+      # Cache Maven explícito para este job — o cache do setup-java no job
+      # 'build' não é compartilhado automaticamente entre jobs diferentes.
+      - name: "Restaurar cache Maven (~/.m2)"
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-maven-
+
+      # Cache do npm/Appium keyed pela versão exata — evita re-download a cada run
+      - name: "Cache npm/Appium"
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-appium-${{ env.APPIUM_VERSION }}-uia2-${{ env.UIAUTOMATOR2_VERSION }}
+          restore-keys: |
+            ${{ runner.os }}-appium-${{ env.APPIUM_VERSION }}-
+
+      # Habilita KVM para aceleração de hardware do emulador Android.
+      # Sem isso, o emulador roda em software rendering — lento e instável.
+      # Fonte: https://github.com/ReactiveCircus/android-emulator-runner#running-hardware-accelerated-emulators-on-linux
+      - name: "Habilitar KVM (aceleração de hardware)"
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          # Verificar que KVM está disponível
+          ls -la /dev/kvm
+          echo "KVM habilitado."
+
+      - name: "Configurar Android SDK"
+        uses: android-actions/setup-android@v3
+
+      - name: "Instalar system image Android API ${{ env.ANDROID_API_LEVEL }}"
+        run: |
+          echo "y" | sdkmanager --install \
+            "system-images;android-${{ env.ANDROID_API_LEVEL }};google_apis;x86_64" \
+            --channel=0
+          echo "✅ System image instalada."
+
+      - name: "Criar AVD (Android Virtual Device)"
+        run: |
+          echo "no" | avdmanager create avd \
+            --force \
+            --name "ci_avd" \
+            --device "pixel_4" \
+            --package "system-images;android-${{ env.ANDROID_API_LEVEL }};google_apis;x86_64" \
+            --abi "google_apis/x86_64"
+          echo "✅ AVD 'ci_avd' criado."
+          avdmanager list avd
+
+      - name: "Configurar Node.js ${{ env.NODE_VERSION }}"
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: "Instalar Appium ${{ env.APPIUM_VERSION }} + UiAutomator2 ${{ env.UIAUTOMATOR2_VERSION }}"
+        run: |
+          npm install -g appium@${{ env.APPIUM_VERSION }}
+          appium driver install uiautomator2@${{ env.UIAUTOMATOR2_VERSION }}
+          echo "Node:          $(node --version)"
+          echo "Appium:        $(appium --version)"
+          appium driver list --installed
+
+      - name: "Criar diretórios de trabalho"
+        run: mkdir -p apps reports/screenshots
+
+      - name: "Download do APK — Sauce Labs Sample App"
+        run: |
+          echo "Baixando APK de ${{ env.APK_URL }} ..."
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            --location \
+            --output apps/swag-labs.apk \
+            "${{ env.APK_URL }}"
+
+          # Verificação de integridade: arquivo deve existir e ter tamanho mínimo
+          # O APK real tem ~12MB. Se o download falhou silenciosamente (ex: rate limit
+          # retornou um HTML de erro), o arquivo existirá mas será minúsculo.
+          APK_SIZE_KB=$(du -k apps/swag-labs.apk | cut -f1)
+          echo "Tamanho do APK: ${APK_SIZE_KB}KB"
+
+          if [ "$APK_SIZE_KB" -lt "${{ env.APK_MIN_SIZE_KB }}" ]; then
+            echo "::error::APK inválido: tamanho ${APK_SIZE_KB}KB é menor que o mínimo esperado (${{ env.APK_MIN_SIZE_KB }}KB)."
+            echo "::error::Possível causa: rate limit do GitHub ou URL incorreta."
+            exit 1
+          fi
+
+          echo "✅ APK verificado com sucesso (${APK_SIZE_KB}KB)."
+
+      - name: "🔑 Garantir permissão de execução do run-tests.sh"
+        run: chmod +x run-tests.sh
+
+      # O android-emulator-runner sobe o emulador, aguarda o boot completo,
+      # executa o script e encerra o emulador — tudo de forma gerenciada.
+      # flags do emulador:
+      #   -no-snapshot-save   não salva estado ao encerrar (build limpo)
+      #   -no-window          headless (sem display)
+      #   -gpu swiftshader_indirect   rendering por software (compatível com CI)
+      #   -noaudio            desabilita áudio (sem placa de som no runner)
+      #   -no-boot-anim       boot mais rápido
+      #   -camera-back none   evita crash por câmera ausente
+      #   -wipe-data          garante estado limpo a cada execução
+      - name: "Executar Testes no Emulador Android"
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: ${{ env.ANDROID_API_LEVEL }}
+          target: google_apis
+          arch: x86_64
+          profile: pixel_4
+          avd-name: ci_avd
+          disable-animations: true
+          emulator-options: >-
+            -no-snapshot-save
+            -no-window
+            -gpu swiftshader_indirect
+            -noaudio
+            -no-boot-anim
+            -camera-back none
+            -wipe-data
+          script: bash run-tests.sh "${{ github.event.inputs.tags || '@smoke' }}"
+
+      # ── Coleta de logs de diagnóstico (apenas quando algo falha) ──────────
+      # Sem estes logs, depurar uma falha no emulador é como operar às cegas.
+      - name: "Coletar logs de diagnóstico"
+        if: failure()
+        run: |
+          echo "=== Appium Log ===" > reports/diagnostics.log
+          cat /tmp/appium.log >> reports/diagnostics.log 2>/dev/null || \
+            echo "(appium.log não encontrado)" >> reports/diagnostics.log
+
+          echo "" >> reports/diagnostics.log
+          echo "=== ADB Devices ===" >> reports/diagnostics.log
+          adb devices >> reports/diagnostics.log 2>/dev/null || true
+
+          echo "" >> reports/diagnostics.log
+          echo "=== Logcat (últimas 300 linhas) ===" >> reports/diagnostics.log
+          adb logcat -d -t 300 >> reports/diagnostics.log 2>/dev/null || \
+            echo "(logcat indisponível)" >> reports/diagnostics.log
+
+          echo "✅ Logs coletados em reports/diagnostics.log"
+
+      # ── Limpeza de processos residuais ────────────────────────────────────
+      # Garante que appium, qemu e emulator não deixem processos zumbis
+      # que possam afetar a conta de runners ou execuções subsequentes.
+      - name: "Encerrar processos residuais"
+        if: always()
+        run: |
+          pkill -f "appium"      2>/dev/null || true
+          pkill -f "qemu-system" 2>/dev/null || true
+          pkill -f "emulator"    2>/dev/null || true
+          adb kill-server        2>/dev/null || true
+          echo "✅ Limpeza concluída."
+
+      # ── Upload dos artefatos ──────────────────────────────────────────────
+      # always() garante que os relatórios são salvos mesmo com testes falhando.
+      - name: "Upload — Relatórios e Evidências"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: "mobile-reports-run-${{ github.run_number }}"
+          path: reports/
+          retention-days: 30
+          if-no-files-found: warn
+
+      # Publica o relatório ExtentReports no GitHub Pages do repositório.
+      # URL resultante: https://rogerpdas.github.io/outsera-automacao-testes-mobile/
+      - name: "Publicar relatório no GitHub Pages"
+        if: always() && github.ref == 'refs/heads/main'
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./reports
+          publish_branch: gh-pages
+
+  # ============================================================================
+  # JOB 3 ── SUMÁRIO CONSOLIDADO
+  # Lê o arquivo summary.properties gerado pelo ExtentReportManager e publica
+  # os números reais de passou/falhou/total no GitHub Actions Summary.
+  # Isso é mais preciso do que inferir resultado apenas pelo exit code.
+  # ============================================================================
+  summary:
+    name: "Job Summary"
+    runs-on: ubuntu-latest
+    needs: test-android
+    if: always()
+
+    steps:
+      - name: "Download dos artefatos de relatório"
+        uses: actions/download-artifact@v4
+        with:
+          name: "mobile-reports-run-${{ github.run_number }}"
+          path: reports/
+
+      - name: "Publicar Job Summary"
+        run: |
+          # Lê métricas reais do summary.properties gerado pelo ExtentReportManager.
+          # Variáveis esperadas: PASSED, FAILED, SKIPPED, TOTAL
+          PASSED=0
+          FAILED=0
+          SKIPPED=0
+          TOTAL=0
+
+          if [ -f reports/summary.properties ]; then
+            # shellcheck disable=SC1091
+            source reports/summary.properties
+            echo "✅ summary.properties carregado."
+          else
+            echo "⚠️  summary.properties não encontrado — métricas zeradas."
+          fi
+
+          # Status global baseado nos números reais
+          if [ "$FAILED" -gt 0 ]; then
+            GLOBAL_STATUS="❌ **FALHOU** ($FAILED cenário(s) com falha)"
+          elif [ "$TOTAL" -eq 0 ]; then
+            GLOBAL_STATUS="⚠️ **SEM DADOS** (nenhum cenário executado)"
+          else
+            GLOBAL_STATUS="✅ **PASSOU** ($PASSED/$TOTAL cenários)"
+          fi
+
+          cat >> "$GITHUB_STEP_SUMMARY" << EOF
+          ## 📱 Resultado — Mobile Tests (Android)
+
+          | Campo       | Valor |
+          |-------------|-------|
+          | **Status**  | ${GLOBAL_STATUS} |
+          | **Branch**  | \`${{ github.ref_name }}\` |
+          | **Commit**  | \`${{ github.sha }}\` |
+          | **Trigger** | \`${{ github.event_name }}\` |
+          | **Run**     | [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |
+          | **Tags**    | \`${{ github.event.inputs.tags || '@smoke' }}\` |
+          | **Java**    | ${{ env.JAVA_VERSION }} |
+          | **Node**    | ${{ env.NODE_VERSION }} |
+          | **Android** | API ${{ env.ANDROID_API_LEVEL }} (Pixel 4) |
+          | **Appium**  | ${{ env.APPIUM_VERSION }} + UiAutomator2 ${{ env.UIAUTOMATOR2_VERSION }} |
+
+          ###Métricas de Execução
+
+          | Status           | Quantidade |
+          |:----------------:|:----------:|
+          | ✅ Passou        | $PASSED |
+          | ❌ Falhou        | $FAILED |
+          | ⚠️ Pulou         | $SKIPPED |
+          | 📋 **Total**     | $TOTAL |
+
+          ### 📦 Artefatos e Relatórios
+
+          | Recurso | Link |
+          |---------|------|
+          | Artefato (30 dias) | [mobile-reports-run-${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |
+          | Relatório HTML | [GitHub Pages](https://rogerpdas.github.io/outsera-automacao-testes-mobile/) |
+
+          > Screenshots de falhas estão embutidas no \`reports/index.html\` e na pasta \`reports/screenshots/\`.
+          EOF

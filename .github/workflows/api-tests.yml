@@ -1,0 +1,276 @@
+name: "API Tests — RestAssured + Cucumber BDD"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# GATILHOS
+# ──────────────────────────────────────────────────────────────────────────────
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  schedule:
+    # Execução noturna toda segunda a sexta às 03:00 UTC (00:00 BRT)
+    # Escalonado: API 03h → Web 04h → Mobile 05h
+    - cron: "0 3 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Ambiente de execução"
+        required: true
+        default: "hom"
+        type: choice
+        options:
+          - hom
+          - prod
+      tags:
+        description: "Tags Cucumber (ex: @smoke, @auth and @positivo)"
+        required: false
+        default: ""
+        type: string
+
+# ──────────────────────────────────────────────────────────────────────────────
+# PERMISSÕES — necessárias para o deploy no GitHub Pages via peaceiris
+# ──────────────────────────────────────────────────────────────────────────────
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CONCORRÊNCIA — cancela runs anteriores no mesmo branch/PR
+# ──────────────────────────────────────────────────────────────────────────────
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: true
+
+# ──────────────────────────────────────────────────────────────────────────────
+# VARIÁVEIS GLOBAIS
+# ──────────────────────────────────────────────────────────────────────────────
+env:
+  JAVA_VERSION: "17"
+  MAVEN_OPTS: >-
+    -Xmx1g
+    -XX:+TieredCompilation
+    -XX:TieredStopAtLevel=1
+    -Djava.security.egd=file:/dev/./urandom
+  TEST_ENV: ${{ github.event.inputs.environment || 'hom' }}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# JOBS
+# ──────────────────────────────────────────────────────────────────────────────
+jobs:
+
+  # ============================================================================
+  # JOB 1 ── BUILD E VALIDAÇÃO
+  # Falha rápida: compilar antes de gastar tempo com health check e testes.
+  # ============================================================================
+  build:
+    name: "Build & Compile"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: "Checkout do repositório"
+        uses: actions/checkout@v4
+
+      - name: "Configurar Java ${{ env.JAVA_VERSION }} (Temurin)"
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          cache: maven
+
+      # Exibir versões — útil para rastrear diferenças entre execuções
+      - name: "Exibir versões do ambiente"
+        run: |
+          java -version
+          mvn -version
+
+      - name: "Validar estrutura do pom.xml"
+        run: mvn validate --no-transfer-progress --batch-mode
+
+      - name: "Compilar fontes de teste"
+        run: mvn test-compile --no-transfer-progress --batch-mode -q
+
+  # ============================================================================
+  # JOB 2 ── HEALTH CHECK DA API
+  # Distingue falha por indisponibilidade do ambiente de falha real no código.
+  # ============================================================================
+  health-check:
+    name: "Health Check — DummyJSON API"
+    runs-on: ubuntu-latest
+    needs: build
+    timeout-minutes: 5
+
+    steps:
+      - name: "Verificar disponibilidade da DummyJSON"
+        run: |
+          echo "Verificando https://dummyjson.com/test ..."
+
+          for attempt in 1 2 3; do
+            HTTP_STATUS=$(curl \
+              --silent --output /dev/null \
+              --write-out "%{http_code}" \
+              --max-time 10 \
+              https://dummyjson.com/test)
+
+            echo "Tentativa $attempt/3 — HTTP $HTTP_STATUS"
+
+            if [ "$HTTP_STATUS" -eq 200 ]; then
+              echo "✅ API disponível."
+              exit 0
+            fi
+
+            sleep 5
+          done
+
+          echo "::error::DummyJSON indisponível após 3 tentativas (status $HTTP_STATUS)."
+          exit 1
+
+  # ============================================================================
+  # JOB 3 ── EXECUÇÃO DOS TESTES DE API
+  # Preserva: mvn test -Denv, --batch-mode, upload-artifact, summary.properties,
+  #           peaceiris GitHub Pages deploy com commit_message customizado.
+  # Adiciona:  secrets para credenciais, GITHUB_STEP_SUMMARY, workflow_dispatch
+  #            com ambiente e tags, cache Maven explícito entre jobs.
+  # ============================================================================
+  api-tests:
+    name: "API Tests — ${{ github.event.inputs.environment || 'hom' }}"
+    runs-on: ubuntu-latest
+    needs: health-check
+    timeout-minutes: 30
+
+    steps:
+      - name: "Checkout do repositório"
+        uses: actions/checkout@v4
+
+      - name: "Configurar Java ${{ env.JAVA_VERSION }} (Temurin)"
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          cache: maven
+
+      # Cache Maven explícito — o cache do job 'build' não é compartilhado
+      # automaticamente com outros jobs
+      - name: "Restaurar cache Maven (~/.m2)"
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-maven-
+
+      - name: "Criar diretórios de saída"
+        run: |
+          mkdir -p test-output/extent-reports
+          mkdir -p target/cucumber-reports
+
+      # ── Execução SEM filtro de tags ────────────────────────────────────────
+      - name: "Executar todos os cenários"
+        if: ${{ !github.event.inputs.tags || github.event.inputs.tags == '' }}
+        env:
+          # Credenciais injetadas via GitHub Secrets — jamais hardcoded
+          API_USERNAME: ${{ secrets.API_USERNAME }}
+          API_PASSWORD: ${{ secrets.API_PASSWORD }}
+        run: |
+          mvn test \
+            -Denv="${{ env.TEST_ENV }}" \
+            --batch-mode \
+            --no-transfer-progress \
+            -Dsurefire.failIfNoSpecifiedTests=false \
+          && echo "TEST_STATUS=passed" >> "$GITHUB_ENV" \
+          || echo "TEST_STATUS=failed" >> "$GITHUB_ENV"
+
+      # ── Execução COM filtro de tags ────────────────────────────────────────
+      - name: "Executar cenários filtrados: ${{ github.event.inputs.tags }}"
+        if: ${{ github.event.inputs.tags && github.event.inputs.tags != '' }}
+        env:
+          API_USERNAME: ${{ secrets.API_USERNAME }}
+          API_PASSWORD: ${{ secrets.API_PASSWORD }}
+        run: |
+          mvn test \
+            -Denv="${{ env.TEST_ENV }}" \
+            -Dcucumber.filter.tags="${{ github.event.inputs.tags }}" \
+            --batch-mode \
+            --no-transfer-progress \
+            -Dsurefire.failIfNoSpecifiedTests=false \
+          && echo "TEST_STATUS=passed" >> "$GITHUB_ENV" \
+          || echo "TEST_STATUS=failed" >> "$GITHUB_ENV"
+
+      # ── Upload dos artefatos ───────────────────────────────────────────────
+      - name: "Upload — Extent Report (HTML)"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: "extent-report-api-${{ github.run_number }}"
+          path: test-output/extent-reports/
+          retention-days: 30
+          if-no-files-found: warn
+
+      # ── Job Summary ────────────────────────────────────────────────────────
+      # Evolução do sumário original: agora vai para GITHUB_STEP_SUMMARY
+      # (visível na aba Actions) e não apenas para o log do step.
+      - name: "Publicar Job Summary"
+        if: always()
+        run: |
+          PASSED=0; FAILED=0; TOTAL=0
+
+          if [ -f test-output/extent-reports/summary.properties ]; then
+            source test-output/extent-reports/summary.properties
+          fi
+
+          if [ "${{ env.TEST_STATUS }}" = "passed" ]; then
+            GLOBAL="✅ **PASSOU**"
+          else
+            GLOBAL="❌ **FALHOU**"
+          fi
+
+          cat >> "$GITHUB_STEP_SUMMARY" << EOF
+          ## Resultado — API Tests
+
+          | Campo              | Valor |
+          |--------------------|-------|
+          | **Status**         | ${GLOBAL} |
+          | **Ambiente**       | \`${{ env.TEST_ENV }}\` |
+          | **Tags**           | \`${{ github.event.inputs.tags || 'todas' }}\` |
+          | **Branch**         | \`${{ github.ref_name }}\` |
+          | **Commit**         | \`${{ github.sha }}\` |
+          | **Trigger**        | \`${{ github.event_name }}\` |
+          | **Run**            | [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |
+
+          ### Métricas de Execução
+
+          | Status       | Quantidade |
+          |:------------:|:----------:|
+          | ✅ Passou    | $PASSED |
+          | ❌ Falhou    | $FAILED |
+          | 📋 **Total** | $TOTAL |
+
+          ### Artefatos e Relatório
+
+          | Recurso | Link |
+          |---------|------|
+          | Artefato (30 dias) | [extent-report-api-${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |
+          | Relatório HTML | [GitHub Pages](https://rogerpdas.github.io/outsera-automacao-testes-api/) |
+          EOF
+
+      # ── Deploy GitHub Pages ────────────────────────────────────────────────
+      # Preservado do original: deploy apenas na main, commit_message rastreável.
+      - name: "Deploy do relatório para GitHub Pages"
+        if: always() && github.ref == 'refs/heads/main'
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: test-output/extent-reports/
+          publish_branch: gh-pages
+          commit_message: "ci: atualiza relatório de testes — run #${{ github.run_number }}"
+
+      # ── Falha explícita ────────────────────────────────────────────────────
+      # Upload e summary sempre executam; a falha do job vem por último.
+      - name: "❌ Falhar o job (testes falharam)"
+        if: env.TEST_STATUS == 'failed'
+        run: |
+          echo "::error::Um ou mais cenários falharam."
+          echo "::error::Relatório: https://rogerpdas.github.io/outsera-automacao-testes-api/"
+          exit 1

@@ -1,0 +1,428 @@
+name: "E2E Tests — Selenium + Cucumber BDD"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# GATILHOS
+# ──────────────────────────────────────────────────────────────────────────────
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  schedule:
+    # Execução noturna toda segunda a sexta às 04:00 UTC (01:00 BRT)
+    # Escalonado: API 03h → Web 04h → Mobile 05h
+    - cron: "0 4 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      browser:
+        description: "Browser para execução dos testes"
+        required: true
+        default: "chrome"
+        type: choice
+        options:
+          - chrome
+          - firefox
+          - edge
+      headless:
+        description: "Executar em modo headless"
+        required: true
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+      tags:
+        description: "Tags Cucumber (ex: @smoke, @login)"
+        required: false
+        default: ""
+        type: string
+
+# ──────────────────────────────────────────────────────────────────────────────
+# PERMISSÕES — necessárias para o deploy no GitHub Pages via peaceiris
+# ──────────────────────────────────────────────────────────────────────────────
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CONCORRÊNCIA — cancela runs anteriores no mesmo branch/PR
+# ──────────────────────────────────────────────────────────────────────────────
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: true
+
+# ──────────────────────────────────────────────────────────────────────────────
+# VARIÁVEIS GLOBAIS
+# ──────────────────────────────────────────────────────────────────────────────
+env:
+  JAVA_VERSION: "17"
+  MAVEN_OPTS: >-
+    -Xmx1g
+    -XX:+TieredCompilation
+    -XX:TieredStopAtLevel=1
+    -Djava.security.egd=file:/dev/./urandom
+  BROWSER:  ${{ github.event.inputs.browser  || 'chrome' }}
+  HEADLESS: ${{ github.event.inputs.headless || 'true'   }}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# JOBS
+# ──────────────────────────────────────────────────────────────────────────────
+jobs:
+
+  # ============================================================================
+  # JOB 1 ── BUILD E VALIDAÇÃO
+  # ============================================================================
+  build:
+    name: "Build & Compile"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: "Checkout do repositório"
+        uses: actions/checkout@v4
+
+      - name: "Configurar Java ${{ env.JAVA_VERSION }} (Temurin)"
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          cache: maven
+
+      - name: "Validar e compilar"
+        run: |
+          mvn validate --no-transfer-progress --batch-mode
+          mvn test-compile --no-transfer-progress --batch-mode -q
+
+  # ============================================================================
+  # JOB 2 ── HEALTH CHECK DO SAUCEDEMO
+  # ============================================================================
+  health-check:
+    name: "Health Check — SauceDemo"
+    runs-on: ubuntu-latest
+    needs: build
+    timeout-minutes: 5
+
+    steps:
+      - name: "Verificar disponibilidade do SauceDemo"
+        run: |
+          for attempt in 1 2 3; do
+            HTTP_STATUS=$(curl \
+              --silent --output /dev/null \
+              --write-out "%{http_code}" \
+              --max-time 15 \
+              https://www.saucedemo.com)
+
+            echo "Tentativa $attempt/3 — HTTP $HTTP_STATUS"
+
+            if [ "$HTTP_STATUS" -eq 200 ]; then
+              echo "✅ SauceDemo disponível."
+              exit 0
+            fi
+
+            sleep 10
+          done
+
+          echo "::error::SauceDemo indisponível após 3 tentativas."
+          exit 1
+
+  # ============================================================================
+  # JOB 3 ── E2E TESTS (Login + Checkout em paralelo)
+  #
+  # Preserva: browser-actions (melhor que apt-get), mvn dependency:resolve,
+  #           DISPLAY :99, upload-artifact, cp ExtentReport → index.html,
+  #           peaceiris/actions-gh-pages com keep_files: false.
+  # Adiciona: job separado do build, health-check como pré-requisito,
+  #           cache Maven explícito, filtro de tags funcional, run_number
+  #           no nome do artefato, summary.properties, permissions.
+  # ============================================================================
+  e2e-login:
+    name: "Login Tests (${{ github.event.inputs.browser || 'chrome' }})"
+    runs-on: ubuntu-latest
+    needs: health-check
+    timeout-minutes: 30
+
+    steps:
+      - name: "Checkout do repositório"
+        uses: actions/checkout@v4
+
+      - name: "Configurar Java ${{ env.JAVA_VERSION }} (Temurin)"
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          cache: maven
+
+      - name: "Restaurar cache Maven (~/.m2)"
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-maven-
+
+      # browser-actions garante browser + driver compatíveis no PATH.
+      # WebDriverManager não precisa baixar nada em runtime.
+      - name: "Instalar Chrome"
+        if: env.BROWSER == 'chrome' || env.BROWSER == ''
+        uses: browser-actions/setup-chrome@latest
+
+      - name: "Instalar Firefox"
+        if: env.BROWSER == 'firefox'
+        uses: browser-actions/setup-firefox@latest
+
+      - name: "Instalar Edge"
+        if: env.BROWSER == 'edge'
+        uses: browser-actions/setup-edge@latest
+
+      - name: "Instalar dependências Maven"
+        run: mvn dependency:resolve --no-transfer-progress
+
+      - name: "Criar diretórios de saída"
+        run: mkdir -p reports/screenshots
+
+      - name: "Executar testes de Login"
+        env:
+          DISPLAY: ":99"
+          VALID_USERNAME:  ${{ secrets.WEB_VALID_USERNAME }}
+          VALID_PASSWORD:  ${{ secrets.WEB_VALID_PASSWORD }}
+          LOCKED_USERNAME: ${{ secrets.WEB_LOCKED_USERNAME }}
+        run: |
+          # Monta o filtro de tags: se vier do input, usa; senão filtra só @login
+          if [ -n "${{ github.event.inputs.tags }}" ]; then
+            TAGS="${{ github.event.inputs.tags }}"
+          else
+            TAGS="@login"
+          fi
+
+          mvn test \
+            -Dbrowser="${{ env.BROWSER }}" \
+            -Dheadless="${{ env.HEADLESS }}" \
+            -Dcucumber.filter.tags="$TAGS" \
+            --no-transfer-progress \
+            --batch-mode \
+            -Dsurefire.failIfNoSpecifiedTests=false \
+          && echo "LOGIN_STATUS=passed" >> "$GITHUB_ENV" \
+          || echo "LOGIN_STATUS=failed" >> "$GITHUB_ENV"
+
+      - name: "Upload — Relatório Login"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: "e2e-report-login-${{ env.BROWSER }}-run-${{ github.run_number }}"
+          path: reports/
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: "❌ Falhar o job (Login falhou)"
+        if: env.LOGIN_STATUS == 'failed'
+        run: exit 1
+
+  e2e-checkout:
+    name: "Checkout Tests (${{ github.event.inputs.browser || 'chrome' }})"
+    runs-on: ubuntu-latest
+    needs: health-check
+    timeout-minutes: 30
+
+    steps:
+      - name: "Checkout do repositório"
+        uses: actions/checkout@v4
+
+      - name: "Configurar Java ${{ env.JAVA_VERSION }} (Temurin)"
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          cache: maven
+
+      - name: "Restaurar cache Maven (~/.m2)"
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-maven-
+
+      - name: "Instalar Chrome"
+        if: env.BROWSER == 'chrome' || env.BROWSER == ''
+        uses: browser-actions/setup-chrome@latest
+
+      - name: "Instalar Firefox"
+        if: env.BROWSER == 'firefox'
+        uses: browser-actions/setup-firefox@latest
+
+      - name: "Instalar Edge"
+        if: env.BROWSER == 'edge'
+        uses: browser-actions/setup-edge@latest
+
+      - name: "Instalar dependências Maven"
+        run: mvn dependency:resolve --no-transfer-progress
+
+      - name: "Criar diretórios de saída"
+        run: mkdir -p reports/screenshots
+
+      - name: "Executar testes de Checkout"
+        env:
+          DISPLAY: ":99"
+          VALID_USERNAME: ${{ secrets.WEB_VALID_USERNAME }}
+          VALID_PASSWORD: ${{ secrets.WEB_VALID_PASSWORD }}
+        run: |
+          if [ -n "${{ github.event.inputs.tags }}" ]; then
+            TAGS="${{ github.event.inputs.tags }}"
+          else
+            TAGS="@checkout"
+          fi
+
+          mvn test \
+            -Dbrowser="${{ env.BROWSER }}" \
+            -Dheadless="${{ env.HEADLESS }}" \
+            -Dcucumber.filter.tags="$TAGS" \
+            --no-transfer-progress \
+            --batch-mode \
+            -Dsurefire.failIfNoSpecifiedTests=false \
+          && echo "CHECKOUT_STATUS=passed" >> "$GITHUB_ENV" \
+          || echo "CHECKOUT_STATUS=failed" >> "$GITHUB_ENV"
+
+      - name: "Upload — Relatório Checkout"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: "e2e-report-checkout-${{ env.BROWSER }}-run-${{ github.run_number }}"
+          path: reports/
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: "Falhar o job (Checkout falhou)"
+        if: env.CHECKOUT_STATUS == 'failed'
+        run: exit 1
+
+  # ============================================================================
+  # JOB 4 ── SUMMARY + DEPLOY GITHUB PAGES
+  # Preserva: cp ExtentReport.html → index.html, peaceiris keep_files: false,
+  #           Job Summary com browser/headless/branch/trigger.
+  # Adiciona: leitura do summary.properties, status real por suíte,
+  #           resultado consolidado, deploy apenas na main.
+  # ============================================================================
+  summary:
+    name: "Summary & Deploy"
+    runs-on: ubuntu-latest
+    needs: [e2e-login, e2e-checkout]
+    if: always()
+
+    steps:
+      - name: "Checkout do repositório (para deploy)"
+        uses: actions/checkout@v4
+
+      # Baixa o relatório de Login para consolidar no Pages
+      - name: "Download — Relatório Login"
+        uses: actions/download-artifact@v4
+        with:
+          name: "e2e-report-login-${{ env.BROWSER }}-run-${{ github.run_number }}"
+          path: reports/login/
+        continue-on-error: true
+
+      # Baixa o relatório de Checkout para consolidar no Pages
+      - name: "Download — Relatório Checkout"
+        uses: actions/download-artifact@v4
+        with:
+          name: "e2e-report-checkout-${{ env.BROWSER }}-run-${{ github.run_number }}"
+          path: reports/checkout/
+        continue-on-error: true
+
+      - name: "📋 Publicar Job Summary"
+        run: |
+          LOGIN_RESULT="${{ needs.e2e-login.result }}"
+          CHECKOUT_RESULT="${{ needs.e2e-checkout.result }}"
+
+          icon() {
+            case "$1" in
+              success) echo "✅ Passou" ;;
+              skipped) echo "⏭️ Pulado" ;;
+              *)        echo "❌ Falhou" ;;
+            esac
+          }
+
+          if [ "$LOGIN_RESULT" = "failure" ] || [ "$CHECKOUT_RESULT" = "failure" ]; then
+            GLOBAL="❌ **FALHOU**"
+          else
+            GLOBAL="✅ **PASSOU**"
+          fi
+
+          cat >> "$GITHUB_STEP_SUMMARY" << EOF
+          ## 🌐 Resultado — E2E Web Tests
+
+          | Campo          | Valor |
+          |----------------|-------|
+          | **Status**     | ${GLOBAL} |
+          | **Browser**    | \`${{ env.BROWSER }}\` |
+          | **Headless**   | \`${{ env.HEADLESS }}\` |
+          | **Tags**       | \`${{ github.event.inputs.tags || 'padrão por suíte' }}\` |
+          | **Branch**     | \`${{ github.ref_name }}\` |
+          | **Trigger**    | \`${{ github.event_name }}\` |
+          | **Run**        | [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |
+
+          ### 📊 Status por Suíte
+
+          | Suíte             | Resultado |
+          |-------------------|-----------|
+          | 🔐 Login Tests    | $(icon "$LOGIN_RESULT") |
+          | 🛒 Checkout Tests | $(icon "$CHECKOUT_RESULT") |
+
+          ### 📦 Artefatos e Relatório
+
+          | Recurso | Link |
+          |---------|------|
+          | Login (30 dias)    | [e2e-report-login-${{ env.BROWSER }}-run-${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |
+          | Checkout (30 dias) | [e2e-report-checkout-${{ env.BROWSER }}-run-${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |
+          | Relatório HTML     | [GitHub Pages](https://rogerpdas.github.io/outsera-automacao-testes-web/) |
+          EOF
+
+      # Gera um index.html na raiz com links para os relatórios de login e checkout
+      - name: "Preparar index.html para o GitHub Pages"
+        run: |
+          cat > reports/index.html << 'EOF'
+          <!DOCTYPE html>
+          <html>
+          <head>
+              <meta charset="utf-8">
+              <title>Relatórios E2E Web</title>
+              <style>
+                  body { font-family: Arial, sans-serif; padding: 30px; background-color: #f4f4f9; color: #333; }
+                  h2 { color: #2c3e50; }
+                  ul { list-style: none; padding: 0; }
+                  li { margin: 15px 0; background: #fff; padding: 15px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+                  a { text-decoration: none; color: #3498db; font-size: 18px; font-weight: bold; }
+                  a:hover { color: #2980b9; text-decoration: underline; }
+                  .container { max-width: 600px; margin: 0 auto; }
+              </style>
+          </head>
+          <body>
+              <div class="container">
+                  <h2>📊 Relatórios de Testes E2E Web</h2>
+                  <p>Selecione a suíte de testes que deseja visualizar:</p>
+                  <ul>
+                      <li><a href="login/ExtentReport.html">🔐 Relatório de Login</a></li>
+                      <li><a href="checkout/ExtentReport.html">🛒 Relatório de Checkout</a></li>
+                  </ul>
+              </div>
+          </body>
+          </html>
+          EOF
+
+      # Preservado do original: keep_files: false + deploy apenas na main
+      - name: "Deploy do relatório para GitHub Pages"
+        if: github.ref == 'refs/heads/main'
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./reports
+          publish_branch: gh-pages
+          keep_files: false
+
+      - name: "❌ Falhar o pipeline (ao menos uma suíte falhou)"
+        if: |
+          needs.e2e-login.result    == 'failure' ||
+          needs.e2e-checkout.result == 'failure'
+        run: |
+          echo "::error::Uma ou mais suítes E2E falharam."
+          exit 1
