@@ -22,7 +22,7 @@ Repositório centralizado com os pipelines de CI/CD para os três projetos de au
 
 ## Pipelines
 
-### API Tests — `api-tests.yml`
+### API Tests — `api-ci.yml`
 
 Testa a API [DummyJSON](https://dummyjson.com) com RestAssured + Cucumber BDD.
 
@@ -65,7 +65,7 @@ build  ──►  health-check  ──►  api-tests
 
 ---
 
-### E2E Web Tests — `e2e-tests.yml`
+### E2E Web Tests — `e2e-ci.yml`
 
 Testa o [SauceDemo](https://www.saucedemo.com) com Selenium 4 + Cucumber BDD. Login e Checkout rodam **em paralelo**.
 
