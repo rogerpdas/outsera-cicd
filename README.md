@@ -13,8 +13,8 @@ Repositório centralizado com os pipelines de CI/CD para os três projetos de au
 ```
 .github/
 └── workflows/
-    ├── api-tests.yml      # API REST — RestAssured + Cucumber
-    ├── e2e-tests.yml      # Web E2E — Selenium + Cucumber
+    ├── api-ci.yml      # API REST — RestAssured + Cucumber
+    ├── e2e-ci.yml      # Web E2E — Selenium + Cucumber
     └── mobile-ci.yml      # Mobile Android — Appium + Cucumber
 ```
 
